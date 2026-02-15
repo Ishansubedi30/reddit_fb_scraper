@@ -9,10 +9,6 @@ from scrapy.exceptions import DropItem
 # =========================
 # Config via environment
 # =========================
-PAGE_ID = os.environ.get("FB_PAGE_ID", "208327419022837")
-PAGE_ACCESS_TOKEN = os.environ.get("FB_PAGE_ACCESS_TOKEN","EAASipm90TW8BQqVZCguKgUMFi6len98PwwfbjEvndWNeTcaxwXj7iJQju9X32jl55OAdiZCnIf5T6Lj3dViz8nV3lyKTWdU0lMTZBhCjGIRmDWo66BcShdZBHqnGAYSFWsvVYjraju1w3zhGWSBpb4ZC4Aa6JLwZCHGR611UsN6wN06cNMDGGNpwbGPDvTZAsAd5ZB07hjFARujcYxGvLxjxdCGiMKYPYtOWlPXUrpkWcZCysM0Qga7VvLwDk7b4ZD")
-GRAPH_API_VERSION = os.environ.get("FB_GRAPH_API_VERSION", "v24.0")
-
 DB_PATH = os.environ.get("REDDIT_TO_FB_DB", "posted.db")
 UPLOAD_MIN_DELAY = float(os.environ.get("UPLOAD_MIN_DELAY", "2.0"))
 UPLOAD_MAX_DELAY = float(os.environ.get("UPLOAD_MAX_DELAY", "6.0"))
@@ -164,44 +160,42 @@ class DedupeDownloadUploadPipeline:
 
         return path
 
+
     # =========================
-    # Facebook upload
+    # Make.com upload (videos only)
     # =========================
     def _upload_to_facebook(self, local_path, item):
-        if not PAGE_ID or not PAGE_ACCESS_TOKEN:
-            raise Exception("Facebook credentials not set")
-
-        ext = os.path.splitext(local_path)[1].lower()
-        is_video = item.get("type") == "video" or ext in (".mp4", ".mov", ".webm", ".mkv")
+        MAKE_WEBHOOK_URL = ""
 
         caption = item.get("title") or ""
 
-        if is_video:
-            url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PAGE_ID}/videos"
-            data = {
-                "description": caption,
-                "access_token": PAGE_ACCESS_TOKEN,
+        # Ensure it's a video
+        ext = os.path.splitext(local_path)[1].lower()
+        is_video = item.get("type") == "video" or ext in (".mp4", ".mov", ".webm", ".mkv")
+        if not is_video:
+            raise Exception("Only video uploads are supported")
+
+        payload = {
+            "caption": caption,
+        }
+
+        with open(local_path, "rb") as f:
+            files = {
+                "file": (os.path.basename(local_path), f, "application/octet-stream")
             }
 
-            with open(local_path, "rb") as f:
-                files = {"file": f}
-                resp = requests.post(url, files=files, data=data, timeout=300)
-
-        else:
-            url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PAGE_ID}/photos"
-            data = {
-                "caption": caption,
-                "access_token": PAGE_ACCESS_TOKEN,
-                "published": "true",
-            }
-
-            with open(local_path, "rb") as f:
-                files = {"source": f}
-                resp = requests.post(url, files=files, data=data, timeout=120)
+            resp = requests.post(
+                MAKE_WEBHOOK_URL,
+                data=payload,
+                files=files,
+                timeout=300,
+            )
 
         if not resp.ok:
-            raise Exception(f"Facebook API error {resp.status_code}: {resp.text}")
+            raise Exception(f"Make webhook error {resp.status_code}: {resp.text}")
+        
+        time.sleep(3)
 
-        j = resp.json()
-        return j.get("post_id") or j.get("id")
+        return resp.text  
+
 
