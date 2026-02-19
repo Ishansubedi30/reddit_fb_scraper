@@ -165,18 +165,26 @@ class DedupeDownloadUploadPipeline:
     # Make.com upload (videos only)
     # =========================
     def _upload_to_facebook(self, local_path, item):
-        MAKE_WEBHOOK_URL = ""
 
         caption = item.get("title") or ""
 
         # Ensure it's a video
         ext = os.path.splitext(local_path)[1].lower()
         is_video = item.get("type") == "video" or ext in (".mp4", ".mov", ".webm", ".mkv")
-        if not is_video:
-            raise Exception("Only video uploads are supported")
+        is_photo = item.get("type") == "preview" or ext in (".jpeg", ".jpg", ".png")
+
+        if not (is_video or is_photo):
+            raise Exception("Only video and image uploads are supported")
+        
+        if is_video:
+            MAKE_WEBHOOK_URL = ""
+
+        if is_photo:
+            MAKE_WEBHOOK_URL = ""
+
 
         payload = {
-            "caption": caption,
+            "caption": f"{caption}\nPlease like and follow \n https://www.youtube.com/@am_ish \nhttps://discord.gg/Qnp2eF5MaU \nall links on: https://linktr.ee/am_ish",
         }
 
         with open(local_path, "rb") as f:
@@ -197,5 +205,4 @@ class DedupeDownloadUploadPipeline:
         time.sleep(3)
 
         return resp.text  
-
 
