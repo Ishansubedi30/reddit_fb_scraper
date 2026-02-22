@@ -16,7 +16,13 @@ class RedditMediaItem(scrapy.Item):
 
 class RedditMediaSpider(scrapy.Spider):
     name = "reddit_media"
-    allowed_domains = ["reddit.com"]
+    allowed_domains = [
+            "reddit.com",
+            "www.reddit.com",
+            "v.redd.it",
+            "i.redd.it",
+            "preview.redd.it"
+        ]
 
     def __init__(self, subreddit="funny", limit=25, *args, **kwargs):
         super().__init__(*args, **kwargs)
