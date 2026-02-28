@@ -29,7 +29,7 @@ class RedditMediaSpider(scrapy.Spider):
         self.subreddit = subreddit
         self.limit = int(limit)
         self.video_count = 0
-        self.image_count = 0
+        self.image_count = 3
         self.seen_ids = set()     # avoid duplicate post processing
         self.last_after = None    # guard against repeating pagination
 
@@ -123,7 +123,8 @@ class RedditMediaSpider(scrapy.Spider):
                     url = html.unescape(fallback).replace("&amp;", "&")
                     item["type"] = "video"
                     item["url"] = url
-                    item["media_urls"] = [url]
+                    # IMPORTANT: do NOT set media_urls for videos so FilesPipeline won't attempt to download them.
+                    item["media_urls"] = []
                     self.video_count += 1
                     yield item
 
