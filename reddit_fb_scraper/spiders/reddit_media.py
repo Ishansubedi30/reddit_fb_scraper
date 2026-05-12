@@ -8,58 +8,67 @@ class RedditMediaItem(scrapy.Item):
     post_id         = scrapy.Field()
     title           = scrapy.Field()
     permalink       = scrapy.Field()
-    type            = scrapy.Field() # image | video | external
-    url             = scrapy.Field() # remote url (for FilesPipeline or direct upload)
-    media_urls      = scrapy.Field() # for FilesPipeline
-    files           = scrapy.Field() # filled by FilesPipeline
+    type            = scrapy.Field()
+    url             = scrapy.Field()
+    media_urls      = scrapy.Field()
+    files           = scrapy.Field()
     downloaded_path = scrapy.Field()
 
 class RedditMediaSpider(scrapy.Spider):
     name = "reddit_media"
     allowed_domains = [
-            "reddit.com",
-            "www.reddit.com",
-            "v.redd.it",
-            "i.redd.it",
-            "preview.redd.it"
-        ]
+        "reddit.com", "www.reddit.com",
+        "v.redd.it", "i.redd.it", "preview.redd.it"
+    ]
 
-    def __init__(self, subreddit="funny", limit=25, *args, **kwargs):
+    def __init__(self, subreddit_list=["instant_regret", "funny"], limit=25, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.subreddit = subreddit
         self.limit = int(limit)
-        self.video_count = 0
-        self.image_count = 3
-        self.seen_ids = set()     # avoid duplicate post processing
-        self.last_after = None    # guard against repeating pagination
+        self.seen_ids = set()
+
+        # Per-subreddit targets — no more shared scalars
+        self.targets = {
+            "instant_regret": {"video": 3, "image": 0},
+            "funny":          {"video": 0, "image": 6},
+        }
+        # Per-subreddit counters and pagination guard
+        self.counts     = {s: {"video": 0, "image": 0} for s in subreddit_list}
+        self.last_after = {s: None for s in subreddit_list}
+
+        self.subreddit_list = subreddit_list
+
+    def _reached_target(self, subreddit):
+        c = self.counts[subreddit]
+        t = self.targets.get(subreddit, {"video": 0, "image": 0})
+        return c["video"] >= t["video"] and c["image"] >= t["image"]
 
     def start_requests(self):
-        url = f"https://www.reddit.com/r/{self.subreddit}/.json?limit={self.limit}&raw_json=1"
-        yield scrapy.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                "Accept": "application/json",
-                "Referer": "https://www.reddit.com/",
-            },
-            meta={
-                "playwright": True,
-                "playwright_include_page": True,
-                # wait for networkidle so JS-driven things settle
-                "playwright_page_methods": [PageMethod("wait_for_load_state", "networkidle")],
-            },
-            callback=self.parse
-        )
+        for subreddit in self.subreddit_list:
+            url = f"https://www.reddit.com/r/{subreddit}/.json?limit={self.limit}&raw_json=1"
+            yield scrapy.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                    "Accept": "application/json",
+                    "Referer": "https://www.reddit.com/",
+                },
+                meta={
+                    "playwright": True,
+                    "playwright_include_page": True,
+                    "playwright_page_methods": [PageMethod("wait_for_load_state", "networkidle")],
+                    "subreddit": subreddit,   # ← carry identity through the request
+                },
+                callback=self.parse,
+            )
 
     async def parse(self, response):
+        subreddit = response.meta["subreddit"]   # ← read from meta, not self
         page = response.meta.get("playwright_page")
         data = None
 
-        # Try direct JSON parsing first (sometimes it works)
         try:
             data = json.loads(response.text)
         except json.JSONDecodeError:
-            # If not JSON, extract rendered page content
             try:
                 text = await page.evaluate(
                     """() => {
@@ -70,7 +79,7 @@ class RedditMediaSpider(scrapy.Spider):
                 )
                 data = json.loads(text)
             except Exception as exc:
-                self.logger.error("Couldn't extract JSON from Playwright-rendered page: %s", exc)
+                self.logger.error("Couldn't extract JSON: %s", exc)
                 snippet = await page.content()
                 self.logger.debug("Page snippet: %s", snippet[:1000])
                 await page.close()
@@ -78,88 +87,75 @@ class RedditMediaSpider(scrapy.Spider):
 
         await page.close()
 
-        posts = data.get("data", {}).get("children", [])
-
-        # global stop (use >= to be robust)
-        if self.video_count >= 2 and self.image_count >= 3:
-            self.logger.info("Reached target counts: videos=%s images=%s; stopping.", self.video_count, self.image_count)
+        if self._reached_target(subreddit):
+            self.logger.info("[%s] Already at target; skipping page.", subreddit)
             return
 
+        posts = data.get("data", {}).get("children", [])
+        t = self.targets.get(subreddit, {"video": 0, "image": 0})
+        c = self.counts[subreddit]
+
         for post in posts:
-            # double-check inside loop
-            if self.video_count >= 2 and self.image_count >= 3:
-                self.logger.info("Reached target counts inside loop; stopping.")
+            if self._reached_target(subreddit):
+                self.logger.info("[%s] Reached targets inside loop; stopping.", subreddit)
                 return
 
             p = post.get("data", {})
             post_id = p.get("id")
-            if not post_id:
-                continue
-
-            # skip duplicates
-            if post_id in self.seen_ids:
+            if not post_id or post_id in self.seen_ids:
                 continue
             self.seen_ids.add(post_id)
 
             item = RedditMediaItem()
-            item["subreddit"] = self.subreddit
-            item["post_id"] = post_id
-            item["title"] = p.get("title")
-            item["permalink"] = "https://www.reddit.com" + p.get("permalink", "")
-            item["type"] = None
-            item["url"] = None
+            item["subreddit"]  = subreddit
+            item["post_id"]    = post_id
+            item["title"]      = p.get("title")
+            item["permalink"]  = "https://www.reddit.com" + p.get("permalink", "")
+            item["type"]       = None
+            item["url"]        = None
             item["media_urls"] = []
 
-            # Reddit-hosted video
             if p.get("is_video"):
-                # check limit before incrementing
-                if self.video_count >= 2:
-                    # we've already got enough videos; skip this
+                if c["video"] >= t["video"]:
                     continue
-                media = p.get("media") or {}
-                reddit_video = media.get("reddit_video", {})
+                reddit_video = (p.get("media") or {}).get("reddit_video", {})
                 fallback = reddit_video.get("fallback_url")
                 if fallback:
                     url = html.unescape(fallback).replace("&amp;", "&")
-                    item["type"] = "video"
-                    item["url"] = url
-                    # IMPORTANT: do NOT set media_urls for videos so FilesPipeline won't attempt to download them.
+                    item["type"]       = "video"
+                    item["url"]        = url
                     item["media_urls"] = []
-                    self.video_count += 1
+                    c["video"] += 1
                     yield item
 
-            # Single image via preview
             elif p.get("preview"):
-                # check limit before incrementing
-                if self.image_count >= 3:
+                if c["image"] >= t["image"]:
                     continue
                 images = p["preview"].get("images", [])
                 if images:
                     src = images[0]["source"]["url"]
                     url = html.unescape(src).replace("&amp;", "&")
-                    item["type"] = "image"
-                    item["url"] = url
+                    item["type"]       = "image"
+                    item["url"]        = url
                     item["media_urls"] = [url]
-                    self.image_count += 1
+                    c["image"] += 1
                     yield item
 
-        # Pagination guard: stop if we've reached targets
-        if self.video_count >= 2 and self.image_count >= 3:
-            self.logger.info("Reached target counts after processing posts; stopping pagination.")
+        if self._reached_target(subreddit):
+            self.logger.info("[%s] Reached targets after processing; stopping pagination.", subreddit)
             return
 
         after = data.get("data", {}).get("after")
         if not after:
-            self.logger.info("No more pages (after is null); stopping.")
+            self.logger.info("[%s] No more pages.", subreddit)
             return
 
-        # If 'after' didn't change from the last request, stop to avoid infinite loops
-        if after == self.last_after:
-            self.logger.info("Pagination 'after' unchanged (%s). Stopping to avoid loop.", after)
+        if after == self.last_after[subreddit]:
+            self.logger.info("[%s] 'after' unchanged (%s); stopping.", subreddit, after)
             return
-        self.last_after = after
+        self.last_after[subreddit] = after
 
-        next_url = f"https://www.reddit.com/r/{self.subreddit}/.json?after={after}&limit={self.limit}&raw_json=1"
+        next_url = f"https://www.reddit.com/r/{subreddit}/.json?after={after}&limit={self.limit}&raw_json=1"
         yield scrapy.Request(
             next_url,
             headers={
@@ -170,6 +166,7 @@ class RedditMediaSpider(scrapy.Spider):
                 "playwright": True,
                 "playwright_include_page": True,
                 "playwright_page_methods": [PageMethod("wait_for_load_state", "networkidle")],
+                "subreddit": subreddit,   # ← always forward it
             },
-            callback=self.parse
+            callback=self.parse,
         )
