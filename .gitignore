@@ -3,3 +3,4 @@ uploaded_posts.db
 .env
 .venv
 posted.db
+cron.log

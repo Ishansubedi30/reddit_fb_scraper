@@ -1,7 +1,12 @@
-import json
-import html
+import asyncio
+import random
+import re
+from html import unescape
+from urllib.parse import urljoin
+
 import scrapy
-from scrapy_playwright.page import PageMethod
+from camoufox.async_api import AsyncCamoufox
+
 
 class RedditMediaItem(scrapy.Item):
     subreddit       = scrapy.Field()
@@ -14,159 +19,215 @@ class RedditMediaItem(scrapy.Item):
     files           = scrapy.Field()
     downloaded_path = scrapy.Field()
 
+
+POST_RE = re.compile(r"<shreddit-post\b[^>]*>", re.IGNORECASE)
+ATTR_RE = re.compile(r'([a-zA-Z0-9_-]+)(?:="([^"]*)")?')
+NEXT_PARTIAL_RE = re.compile(
+    r'<faceplate-partial[^>]*slot="load-after"[^>]*src="([^"]+)"',
+    re.IGNORECASE,
+)
+VIDEO_MP4_RE = re.compile(r"packaged-media\.redd\.it/[^\"'\s]+/pb/m2-res_\d+p\.mp4[^\"'\s]*")
+
+
+def parse_post_attrs(tag_html):
+    attrs = {}
+    inner = tag_html[len("<shreddit-post"):-1].strip()
+    for m in ATTR_RE.finditer(inner):
+        key, val = m.group(1), m.group(2)
+        if key.lower() == "class":
+            continue
+        attrs[key] = unescape(val) if val is not None else True
+    return attrs
+
+
 class RedditMediaSpider(scrapy.Spider):
     name = "reddit_media"
-    allowed_domains = [
-        "reddit.com", "www.reddit.com",
-        "v.redd.it", "i.redd.it", "preview.redd.it"
-    ]
+    custom_settings = {
+        "CONCURRENT_REQUESTS": 1,
+        "DOWNLOAD_DELAY": 0,
+    }
 
-    def __init__(self, subreddit_list=["instant_regret", "funny"], limit=25, *args, **kwargs):
+    def __init__(self, subreddit_list=["instant_regret", "funny"], limit=25,
+                 min_page_delay=4.0, max_page_delay=9.0,
+                 min_post_delay=2.0, max_post_delay=5.0,
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if isinstance(subreddit_list, str):
+            subreddit_list = [s.strip() for s in subreddit_list.split(",") if s.strip()]
+        self.subreddit_list = subreddit_list
         self.limit = int(limit)
         self.seen_ids = set()
 
-        # Per-subreddit targets — no more shared scalars
         self.targets = {
             "instant_regret": {"video": 3, "image": 0},
             "funny":          {"video": 0, "image": 6},
         }
-        # Per-subreddit counters and pagination guard
-        self.counts     = {s: {"video": 0, "image": 0} for s in subreddit_list}
-        self.last_after = {s: None for s in subreddit_list}
+        self.counts = {s: {"video": 0, "image": 0} for s in subreddit_list}
 
-        self.subreddit_list = subreddit_list
+        self.min_page_delay = float(min_page_delay)
+        self.max_page_delay = float(max_page_delay)
+        self.min_post_delay = float(min_post_delay)
+        self.max_post_delay = float(max_post_delay)
 
     def _reached_target(self, subreddit):
         c = self.counts[subreddit]
         t = self.targets.get(subreddit, {"video": 0, "image": 0})
         return c["video"] >= t["video"] and c["image"] >= t["image"]
 
-    def start_requests(self):
-        for subreddit in self.subreddit_list:
-            url = f"https://www.reddit.com/r/{subreddit}/.json?limit={self.limit}&raw_json=1"
-            yield scrapy.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                    "Accept": "application/json",
-                    "Referer": "https://www.reddit.com/",
-                },
-                meta={
-                    "playwright": True,
-                    "playwright_include_page": True,
-                    "playwright_page_methods": [PageMethod("wait_for_load_state", "networkidle")],
-                    "subreddit": subreddit,   # ← carry identity through the request
-                },
-                callback=self.parse,
-            )
+    async def start(self):
+        async with AsyncCamoufox(headless=True, humanize=True, geoip=True) as browser:
+            for subreddit in self.subreddit_list:
+                if self._reached_target(subreddit):
+                    continue
+                context = await browser.new_context()
+                page = await context.new_page()
+                try:
+                    async for item in self._crawl_subreddit(page, subreddit):
+                        yield item
+                finally:
+                    await context.close()
+                await asyncio.sleep(random.uniform(self.min_page_delay, self.max_page_delay))
 
-    async def parse(self, response):
-        subreddit = response.meta["subreddit"]   # ← read from meta, not self
-        page = response.meta.get("playwright_page")
-        data = None
+    async def start_requests(self):
+        return
+        yield
 
-        try:
-            data = json.loads(response.text)
-        except json.JSONDecodeError:
-            try:
-                text = await page.evaluate(
-                    """() => {
-                        const pre = document.querySelector('pre');
-                        if (pre) return pre.innerText;
-                        return document.documentElement.innerText;
-                    }"""
-                )
-                data = json.loads(text)
-            except Exception as exc:
-                self.logger.error("Couldn't extract JSON: %s", exc)
-                snippet = await page.content()
-                self.logger.debug("Page snippet: %s", snippet[:1000])
-                await page.close()
-                return
+    async def _crawl_subreddit(self, page, subreddit):
+        url = f"https://www.reddit.com/r/{subreddit}/"
+        await page.goto(url, wait_until="networkidle", timeout=60000)
+        await self._wait_out_challenge(page)
 
-        await page.close()
+        html = await page.content()
+        pages_fetched = 0
+        max_pages = max(4, (self.limit // 20) + 4)
 
-        if self._reached_target(subreddit):
-            self.logger.info("[%s] Already at target; skipping page.", subreddit)
-            return
+        while True:
+            posts = self._extract_posts(html)
+            for post in posts:
+                if self._reached_target(subreddit):
+                    break
+                item = await self._build_item(page, post, subreddit)
+                if item is not None:
+                    yield item
+                    await asyncio.sleep(random.uniform(self.min_post_delay, self.max_post_delay))
 
-        posts = data.get("data", {}).get("children", [])
-        t = self.targets.get(subreddit, {"video": 0, "image": 0})
-        c = self.counts[subreddit]
-
-        for post in posts:
             if self._reached_target(subreddit):
-                self.logger.info("[%s] Reached targets inside loop; stopping.", subreddit)
+                self.logger.info("[%s] Targets reached.", subreddit)
                 return
 
-            p = post.get("data", {})
-            post_id = p.get("id")
+            pages_fetched += 1
+            if pages_fetched >= max_pages:
+                self.logger.info("[%s] Reached max_pages guard (%s).", subreddit, max_pages)
+                return
+
+            next_path = self._next_partial_src(html)
+            if not next_path:
+                self.logger.info("[%s] No more pagination partial found, stopping.", subreddit)
+                return
+
+            next_url = urljoin("https://www.reddit.com", unescape(next_path))
+            await asyncio.sleep(random.uniform(self.min_page_delay, self.max_page_delay))
+
+            try:
+                resp = await page.request.get(
+                    next_url,
+                    headers={
+                        "Accept": "text/vnd.reddit.partial+html, text/html;q=0.9",
+                        "x-original-referer": page.url,
+                        "Referer": page.url,
+                    },
+                )
+                if resp.status != 200:
+                    self.logger.warning("[%s] Pagination fetch failed with %s", subreddit, resp.status)
+                    return
+                html = await resp.text()
+            except Exception as exc:
+                self.logger.warning("[%s] Pagination fetch error: %s", subreddit, exc)
+                return
+
+    async def _wait_out_challenge(self, page):
+        for _ in range(15):
+            content = await page.content()
+            if "js_challenge" not in page.url and "shreddit-post" in content:
+                return
+            await asyncio.sleep(1.0)
+
+    def _extract_posts(self, html):
+        posts = []
+        for tag in POST_RE.findall(html):
+            attrs = parse_post_attrs(tag)
+            post_id = attrs.get("id")
             if not post_id or post_id in self.seen_ids:
                 continue
-            self.seen_ids.add(post_id)
+            posts.append(attrs)
+        return posts
 
-            item = RedditMediaItem()
-            item["subreddit"]  = subreddit
-            item["post_id"]    = post_id
-            item["title"]      = p.get("title")
-            item["permalink"]  = "https://www.reddit.com" + p.get("permalink", "")
-            item["type"]       = None
-            item["url"]        = None
-            item["media_urls"] = []
+    def _next_partial_src(self, html):
+        m = NEXT_PARTIAL_RE.search(html)
+        return m.group(1) if m else None
 
-            if p.get("is_video"):
-                if c["video"] >= t["video"]:
-                    continue
-                reddit_video = (p.get("media") or {}).get("reddit_video", {})
-                fallback = reddit_video.get("fallback_url")
-                if fallback:
-                    url = html.unescape(fallback).replace("&amp;", "&")
-                    item["type"]       = "video"
-                    item["url"]        = url
-                    item["media_urls"] = []
-                    c["video"] += 1
-                    yield item
+    async def _build_item(self, page, attrs, subreddit):
+        post_id = attrs["id"]
+        post_type = attrs.get("post-type")
+        content_href = attrs.get("content-href")
+        permalink = attrs.get("permalink")
+        title = attrs.get("post-title")
 
-            elif p.get("preview"):
-                if c["image"] >= t["image"]:
-                    continue
-                images = p["preview"].get("images", [])
-                if images:
-                    src = images[0]["source"]["url"]
-                    url = html.unescape(src).replace("&amp;", "&")
-                    item["type"]       = "image"
-                    item["url"]        = url
-                    item["media_urls"] = [url]
-                    c["image"] += 1
-                    yield item
+        self.seen_ids.add(post_id)
 
-        if self._reached_target(subreddit):
-            self.logger.info("[%s] Reached targets after processing; stopping pagination.", subreddit)
-            return
+        if post_type not in ("video", "image") or not content_href:
+            return None
 
-        after = data.get("data", {}).get("after")
-        if not after:
-            self.logger.info("[%s] No more pages.", subreddit)
-            return
+        c = self.counts[subreddit]
+        t = self.targets.get(subreddit, {"video": 0, "image": 0})
 
-        if after == self.last_after[subreddit]:
-            self.logger.info("[%s] 'after' unchanged (%s); stopping.", subreddit, after)
-            return
-        self.last_after[subreddit] = after
+        if post_type == "video" and c["video"] >= t["video"]:
+            return None
+        if post_type == "image" and c["image"] >= t["image"]:
+            return None
 
-        next_url = f"https://www.reddit.com/r/{subreddit}/.json?after={after}&limit={self.limit}&raw_json=1"
-        yield scrapy.Request(
-            next_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64)",
-                "Referer": "https://www.reddit.com/",
-            },
-            meta={
-                "playwright": True,
-                "playwright_include_page": True,
-                "playwright_page_methods": [PageMethod("wait_for_load_state", "networkidle")],
-                "subreddit": subreddit,   # ← always forward it
-            },
-            callback=self.parse,
-        )
+        item = RedditMediaItem()
+        item["subreddit"] = subreddit
+        item["post_id"]   = post_id
+        item["title"]     = title
+        item["permalink"] = urljoin("https://www.reddit.com", permalink) if permalink else None
+        item["type"]      = post_type
+        item["media_urls"] = []
+
+        if post_type == "video":
+            media_url = await self._resolve_video_url(page, content_href)
+            if not media_url:
+                self.logger.warning("[%s] Could not resolve video source for %s", subreddit, post_id)
+                return None
+            item["url"] = media_url
+            c["video"] += 1
+        else:
+            item["url"] = content_href
+            item["media_urls"] = [content_href]
+            c["image"] += 1
+
+        return item
+
+    async def _resolve_video_url(self, page, post_url):
+        found = {}
+
+        def on_response(response):
+            if "url" not in found and VIDEO_MP4_RE.search(response.url):
+                found["url"] = response.url
+
+        context = page.context
+        video_page = await context.new_page()
+        video_page.on("response", on_response)
+        try:
+            await video_page.goto(post_url, wait_until="networkidle", timeout=45000)
+            for _ in range(12):
+                if "url" in found:
+                    break
+                await asyncio.sleep(1.0)
+        except Exception as exc:
+            self.logger.debug("Video resolve error for %s: %s", post_url, exc)
+        finally:
+            video_page.remove_listener("response", on_response)
+            await video_page.close()
+
+        return found.get("url")
